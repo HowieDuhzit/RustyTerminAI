@@ -1,130 +1,125 @@
-
+use clap::Parser;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use std::env;
-use std::process::{Command, Stdio};
-use std::time::Instant;
-use reqwest::blocking::Client;
-use serde_json::{json, Value};
-use std::io::{self, Write};
+use std::fs;
+use std::io::self;
+use std::path::Path;
+use tokio;
 
-fn main() {
-    // Start timing for latency measurement
-    let start = Instant::now();
+#[derive(Parser)]
+struct Args {
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,  // The unknown command and args
+}
 
-    // Get command-line arguments (the unrecognized command)
-    let args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
-        eprintln!("No command provided");
-        std::process::exit(1);
-    }
+#[derive(Deserialize, Serialize)]
+struct Config {
+    api_provider: String,  // "grok" or "openrouter"
+    api_key: String,
+    model: String,  // e.g., "grok-3" or "anthropic/claude-3.5-sonnet"
+}
 
-    let command = args.join(" ");
+#[derive(Serialize)]
+struct Request {
+    model: String,
+    messages: Vec<Message>,
+}
 
-    // Step 1: Validate if the command exists locally (~1-5ms target)
-    if is_command_valid(&command) {
-        println!("Command '{}' exists, executing normally.", command);
-        std::process::exit(0);
-    }
+#[derive(Serialize)]
+struct Message {
+    role: String,
+    content: String,
+}
 
-    // Step 2: Query the selected API for unrecognized command
-    let api_provider = env::var("API_PROVIDER").unwrap_or_else(|_| "xai".to_string());
-    let response = match api_provider.as_str() {
-        "openrouter" => query_openrouter_api(&command),
-        _ => query_xai_api(&command), // Default to xAI
+#[derive(Deserialize)]
+struct Response {
+    choices: Vec<Choice>,
+}
+
+#[derive(Deserialize)]
+struct Choice {
+    message: MessageContent,
+}
+
+#[derive(Deserialize)]
+struct MessageContent {
+    content: String,
+}
+
+async fn query_api(client: &Client, config: &Config, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let url = match config.api_provider.as_str() {
+        "grok" => "https://api.x.ai/v1/chat/completions",  // See https://x.ai/api for exact endpoint
+        "openrouter" => "https://openrouter.ai/api/v1/chat/completions",
+        _ => return Err("Invalid provider".into()),
     };
 
-    match response {
-        Ok(response) => {
-            println!("{}", response);
-        }
-        Err(e) => {
-            eprintln!("Error querying API: {}", e);
-            std::process::exit(1);
-        }
+    let mut request = Request {
+        model: config.model.clone(),
+        messages: vec![Message {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }],
+    };
+
+    // Add system prompt for context
+    request.messages.insert(0, Message {
+        role: "system".to_string(),
+        content: "You are a helpful shell assistant. Provide safe, accurate command suggestions.".to_string(),
+    });
+
+    let res = client.post(url)
+        .header("Authorization", format!("Bearer {}", config.api_key))
+        .header("Content-Type", "application/json")
+        .json(&request)
+        .send()
+        .await?;
+
+    let body: Response = res.json().await?;
+    Ok(body.choices[0].message.content.clone())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+    if args.command.is_empty() {
+        println!("No command provided.");
+        return Ok(());
     }
 
-    // Measure and report latency
-    let duration = start.elapsed();
-    eprintln!("Processing time: {:?}", duration);
-}
+    // Load config from ~/.grok-cmd.toml
+    let home = env::var("HOME")?;
+    let config_path = Path::new(&home).join(".grok-cmd.toml");
+    let config_str = fs::read_to_string(config_path)?;
+    let config: Config = toml::from_str(&config_str)?;
 
-// Check if a command exists in the system PATH
-fn is_command_valid(command: &str) -> bool {
-    let cmd = command.split_whitespace().next().unwrap_or(command);
-    Command::new("which")
-        .arg(cmd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-// Query xAI Grok API
-fn query_xai_api(command: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = env::var("XAI_API_KEY").unwrap_or_else(|_| {
-        eprintln!("XAI_API_KEY environment variable not set");
-        std::process::exit(1);
-    });
-
-    let client = Client::new();
-    let context = format!(
-        "User entered an unrecognized command: '{}'. Provide a helpful suggestion or explanation.",
-        command
+    // Build prompt with context
+    let cmd = args.command.join(" ");
+    let pwd = env::current_dir()?.display().to_string();
+    let username = whoami::username();
+    let prompt = format!(
+        "User '{}' in directory '{} typed unknown command '{}'. Suggest correction or alternative. Be concise and safe.",
+        username, pwd, cmd
     );
 
-    let payload = json!({
-        "prompt": context,
-        "model": "grok-3"
-    });
-
-    let response = client
-        .post("https://api.x.ai/v1/grok")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&payload)
-        .send()?;
-
-    let json: Value = response.json()?;
-    let suggestion = json["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("No suggestion available")
-        .to_string();
-
-    Ok(suggestion)
-}
-
-// Query OpenRouter API
-fn query_openrouter_api(command: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let api_key = env::var("OPENROUTER_API_KEY").unwrap_or_else(|_| {
-        eprintln!("OPENROUTER_API_KEY environment variable not set");
-        std::process::exit(1);
-    });
-
     let client = Client::new();
-    let context = format!(
-        "User entered an unrecognized command: '{}'. Provide a helpful suggestion or explanation.",
-        command
-    );
+    match query_api(&client, &config, &prompt).await {
+        Ok(suggestion) => {
+            println!("Suggestion: {}", suggestion);
+            // Optional: Interactive execution
+            //println!("Run this? [y/n]");
+            //let stdin = io::stdin();
+            //let mut lines = stdin.lines();
+            //if let Some(Ok(line)) = lines.next() {
+            //    if line.trim().to_lowercase() == "y" {
+            //        // Execute suggestion (safely parse and run via std::process::Command)
+            //        // Warning: Add safeguards to avoid dangerous commands!
+            //    }
+            //}
+        }
+        Err(e) => println!("Error: {}", e),
+    }
 
-    let payload = json!({
-        "model": "meta-ai/llama-3.1-8b-instruct", // Example model, adjustable
-        "messages": [
-            {"role": "user", "content": context}
-        ]
-    });
-
-    let response = client
-        .post("https://openrouter.ai/api/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("HTTP-Referer", "https://SleepyStudio.xyz") // Replace with your app's URL
-        .header("X-Title", "TerminAI")
-        .json(&payload)
-        .send()?;
-
-    let json: Value = response.json()?;
-    let suggestion = json["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("No suggestion available")
-        .to_string();
-
-    Ok(suggestion)
+    // Return 127 to mimic command-not-found exit code
+    std::process::exit(127);
 }
