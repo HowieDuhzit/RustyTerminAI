@@ -115,8 +115,8 @@ fn query_openrouter_api(command: &str) -> Result<String, Box<dyn std::error::Err
     let response = client
         .post("https://openrouter.ai/api/v1/chat/completions")
         .header("Authorization", format!("Bearer {}", api_key))
-        .header("HTTP-Referer", "https://your-app.com") // Replace with your app's URL
-        .header("X-Title", "grok-cli")
+        .header("HTTP-Referer", "https://SleepyStudio.xyz") // Replace with your app's URL
+        .header("X-Title", "TerminAI")
         .json(&payload)
         .send()?;
 
